@@ -22,8 +22,8 @@ import json
 import os
 import binascii
 import sys
-sys.path.append('/Users/Planter')
-os.chdir('/Users/Planter')
+sys.path.append('/mnt/c/Users/Oxford-Wei/Documents/GitHub/Planter')
+os.chdir('/mnt/c/Users/Oxford-Wei/Documents/GitHub/Planter')
 print('working dir: ' + os.getcwd())
 table = json.load(open('./Tables/Ternary_Table.json','r'))
 Planter_config = json.load(open('./src/configs/Planter_config.json','r'))

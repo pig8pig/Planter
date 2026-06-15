@@ -115,4 +115,18 @@ cython_debug/
 .DS_Store
 .idea/
 .ide
+src/configs/Planter_config.json
 
+# --- GSoC: local run outputs (regenerable; keep out of git) ---
+src/temp/
+*.pcap
+tree*.txt
+Test_Data.json
+# generated table entries / runtime
+Tables/Exact_Table.json
+Tables/Ternary_Table.json
+Tables/Runtime.json
+Tables/s1-commands.txt
+# generated bmv2 test environment (per-run artifacts)
+src/targets/bmv2/software/model_test/test_environment/
+P4/DT_*.p4
