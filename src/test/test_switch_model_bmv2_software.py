@@ -42,7 +42,7 @@ class Planter(Packet):
 
 bind_layers(Ether, Planter, type=0x1234)
 
-config_file = '/mnt/c/Users/Oxford-Wei/Documents/GitHub/Planter/src/temp/Test_Data.json'
+config_file = '/home/pi/Planter/src/temp/Test_Data.json'
 Test_Data = json.load(open(config_file, 'r'))
 sklearn_test_y = Test_Data['sklearn_test_y']
 test_X = Test_Data['test_X']

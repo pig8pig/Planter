@@ -32,7 +32,7 @@ endif
 all: run
 
 run: build
-	sudo PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python PYTHONPATH=/usr/local/lib/python3.12/site-packages python3 $(RUN_SCRIPT) -t $(TOPO) $(run_args)
+	sudo PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python PYTHONPATH=/usr/lib/python3/dist-packages python3 $(RUN_SCRIPT) -t $(TOPO) $(run_args)
 
 stop:
 	sudo mn -c
