@@ -1,0 +1,13 @@
+match 0 0 0 0 action read_lable label 00000000
+match 0 0 1 0 action read_lable label 00000000
+match 0 0 2 0 action read_lable label 00000000
+match 0 1 0 0 action read_lable label 00000000
+match 0 1 1 0 action read_lable label 00000000
+match 0 1 2 0 action read_lable label 00000000
+match 0 0 2 1 action read_lable label 00000002
+match 0 1 2 1 action read_lable label 00000002
+match 0 0 1 3 action read_lable label 00000002
+match 0 0 2 3 action read_lable label 00000002
+match 0 1 1 3 action read_lable label 00000002
+match 0 1 2 3 action read_lable label 00000002
+match 0 0 0 3 action read_lable label 00000002

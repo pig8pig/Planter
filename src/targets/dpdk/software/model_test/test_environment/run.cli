@@ -1,0 +1,11 @@
+mempool MEMPOOL0 buffer 2304 pool 32K cache 256 cpu 0
+pipeline PIPELINE0 create 0
+pipeline PIPELINE0 port in 0 source MEMPOOL0 /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/test_input.pcap
+pipeline PIPELINE0 port out 0 sink /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/test_output.pcap
+pipeline PIPELINE0 build /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/spec/DT_performance_Iris.spec
+pipeline PIPELINE0 table lookup_feature0 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature0_entries.txt none none
+pipeline PIPELINE0 table lookup_feature1 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature1_entries.txt none none
+pipeline PIPELINE0 table lookup_feature2 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature2_entries.txt none none
+pipeline PIPELINE0 table lookup_feature3 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature3_entries.txt none none
+pipeline PIPELINE0 table decision update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/decision_entries.txt none none
+thread 1 pipeline PIPELINE0 enable
