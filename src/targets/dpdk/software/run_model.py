@@ -178,13 +178,16 @@ def generate_cli_script(cli_path, spec_path, entries_dir,
         f.write("thread 1 pipeline PIPELINE0 enable\n")
     print(f"CLI script written to {cli_path}")
 
-def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, timeout=30):
+def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, output_pcap=None, timeout=30):
     """
     Launch dpdk-pipeline, wait for it to process packets, capture log.
     Returns (success, log_output)
     """
     cmd = ['sudo', pipeline_binary, '-c', '0x3', '--', '-s', cli_path]
     output_pcap = None
+
+    def has_cli_table_errors(log_text):
+        return ('Error in file "' in log_text) or ('Invalid entry in file' in log_text)
 
     try:
         with open(cli_path, 'r') as cli_file:
@@ -200,7 +203,7 @@ def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, timeout=30):
             os.remove(output_pcap)
         except OSError:
             pass
-    
+
     try:
         result = sub.run(
             cmd,
@@ -211,7 +214,7 @@ def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, timeout=30):
         log_output = result.stdout + result.stderr
         with open(log_path, 'w') as f:
             f.write(log_output)
-        if result.returncode != 0:
+        if result.returncode != 0 or has_cli_table_errors(log_output):
             return False, log_output
         return True, log_output
     except sub.TimeoutExpired as e:
@@ -220,6 +223,8 @@ def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, timeout=30):
              (e.stderr or b'').decode('utf-8', errors='replace')
         with open(log_path, 'w') as f:
             f.write(log_output)
+        if has_cli_table_errors(log_output):
+            return False, log_output
         return True, log_output
     except Exception as e:
         return False, str(e)
@@ -229,6 +234,7 @@ def add_make_run_model(fname, config):
     
     spec_dir    = os.path.join(model_test_root, 'spec')
     entries_dir = os.path.join(model_test_root, 'entries')
+    manual_entries_dir = os.path.join(work_root, 'scripts', 'dpdk_entries')
     input_pcap  = os.path.join(model_test_root, 'test_input.pcap')
     output_pcap = os.path.join(model_test_root, 'test_output.pcap')
     cli_path    = os.path.join(model_test_root, 'run.cli')
@@ -237,6 +243,18 @@ def add_make_run_model(fname, config):
 
     p4_file = os.path.join(work_root, 'P4', file_name + '.p4')
 
+    required_entry_files = [
+        'lookup_feature0_entries.txt',
+        'lookup_feature1_entries.txt',
+        'lookup_feature2_entries.txt',
+        'lookup_feature3_entries.txt',
+        'decision_entries.txt',
+    ]
+    manual_entries_available = all(
+        os.path.exists(os.path.join(manual_entries_dir, name))
+        for name in required_entry_files
+    )
+
     # Step 1 — compile
     print("Compiling P4 with p4c-dpdk...")
     success, spec_path, err = compile_p4_dpdk(p4_file, spec_dir)
@@ -244,17 +262,22 @@ def add_make_run_model(fname, config):
         print(f"Compile failed:\n{err}")
         return
 
-    # Step 2 — generate entry files FIRST (patch_spec_file needs them for size calculation)
-    print("Generating table entry files...")
-    generate_entry_files(work_root, entries_dir)
+    # Step 2 — choose entry source FIRST (patch_spec_file needs them for size calculation)
+    if manual_entries_available:
+        entries_source_dir = manual_entries_dir
+        print(f"Using pre-validated entry files from {entries_source_dir}")
+    else:
+        entries_source_dir = entries_dir
+        print("Generating table entry files...")
+        generate_entry_files(work_root, entries_source_dir)
 
     # Step 3 — patch spec (now entry files exist for size counting)
     print("Patching spec file...")
-    patch_spec_file(spec_path, entries_dir)
+    patch_spec_file(spec_path, entries_source_dir)
 
     # Step 4 — generate CLI script
     print("Generating CLI script...")
-    generate_cli_script(cli_path, spec_path, entries_dir, input_pcap, output_pcap)
+    generate_cli_script(cli_path, spec_path, entries_source_dir, input_pcap, output_pcap)
 
     # Store paths in config for test_model.py to use
     config['dpdk config'] = {
@@ -262,6 +285,7 @@ def add_make_run_model(fname, config):
         'output_pcap':  output_pcap,
         'log_path':     log_path,
         'pipeline_bin': pipeline_bin,
+        'entries_dir':  entries_source_dir,
     }
     json.dump(config, open('src/configs/Planter_config.json', 'w'), indent=4)
     print("run_model setup complete — ready to run pipeline")
