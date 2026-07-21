@@ -101,20 +101,41 @@ def patch_spec_file(spec_path, entries_dir):
         'lookup_feature3': 'lookup_feature3_entries.txt',
         'decision':        'decision_entries.txt',
     }
+    lines = spec.splitlines()
     for table_name, entry_file in table_entry_files.items():
         entry_path = os.path.join(entries_dir, entry_file)
         if not os.path.exists(entry_path):
             continue
+
         with open(entry_path) as ef:
             n_entries = sum(1 for line in ef if line.strip())
-        correct_size = next_valid_size(n_entries)
-        # Replace size line inside this specific table block
-        spec = re.sub(
-            rf'(table {table_name} {{[^}}]*?size\s+)0x[0-9a-fA-F]+',
-            lambda m: m.group(1) + hex(correct_size),
-            spec,
-            flags=re.DOTALL
-        )
+
+        # Keep one extra slot for default/action-state overhead to avoid commit failures
+        # when table entry count equals nominal size.
+        correct_size = next_valid_size(n_entries + 1)
+
+        in_target_table = False
+        brace_depth = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+
+            if not in_target_table:
+                if stripped.startswith(f'table {table_name} '):
+                    in_target_table = True
+                    brace_depth += line.count('{') - line.count('}')
+                continue
+
+            # While inside target table, replace its size line.
+            if stripped.startswith('size '):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[i] = f"{indent}size {hex(correct_size)}"
+
+            brace_depth += line.count('{') - line.count('}')
+            if brace_depth <= 0:
+                in_target_table = False
+                brace_depth = 0
+
+    spec = '\n'.join(lines) + '\n'
 
     with open(spec_path, 'w') as f:
         f.write(spec)
@@ -129,7 +150,7 @@ def generate_entry_files(work_root, output_dir):
 
     def covered_values(value, mask):
         target = value & mask
-        return [x for x in range(256) if (x & mask) == target]
+        return [x for x in range(256) if (x & value) == target]
 
     # Feature lookup tables
     for n in range(4):
@@ -140,7 +161,7 @@ def generate_entry_files(work_root, output_dir):
             for x in covered_values(value, mask):
                 if x not in seen:
                     seen[x] = code
-                    lines.append(f"match {x} action extract_feature{n} tree {code:08x}")
+                    lines.append(f"match {x} action extract_feature{n} tree H({int(code)})")
         out_path = os.path.join(output_dir, f'lookup_feature{n}_entries.txt')
         with open(out_path, 'w') as f:
             f.write('\n'.join(lines) + '\n')
@@ -151,7 +172,7 @@ def generate_entry_files(work_root, output_dir):
     for entry in table['code to vote'].values():
         f0, f1, f2, f3 = entry['f0 code'], entry['f1 code'], entry['f2 code'], entry['f3 code']
         leaf = entry['leaf']
-        lines.append(f"match {f0} {f1} {f2} {f3} action read_lable label {int(leaf):08x}")
+        lines.append(f"match {f0} {f1} {f2} {f3} action read_lable label N({int(leaf)})")
     out_path = os.path.join(output_dir, 'decision_entries.txt')
     with open(out_path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
@@ -254,6 +275,7 @@ def add_make_run_model(fname, config):
         os.path.exists(os.path.join(manual_entries_dir, name))
         for name in required_entry_files
     )
+    force_generate_entries = os.environ.get('PLANTER_FORCE_GENERATE_ENTRIES', '0') == '1'
 
     # Step 1 — compile
     print("Compiling P4 with p4c-dpdk...")
@@ -263,12 +285,15 @@ def add_make_run_model(fname, config):
         return
 
     # Step 2 — choose entry source FIRST (patch_spec_file needs them for size calculation)
-    if manual_entries_available:
+    if manual_entries_available and not force_generate_entries:
         entries_source_dir = manual_entries_dir
         print(f"Using pre-validated entry files from {entries_source_dir}")
     else:
         entries_source_dir = entries_dir
-        print("Generating table entry files...")
+        if force_generate_entries:
+            print("Force-generating table entry files (PLANTER_FORCE_GENERATE_ENTRIES=1)...")
+        else:
+            print("Generating table entry files...")
         generate_entry_files(work_root, entries_source_dir)
 
     # Step 3 — patch spec (now entry files exist for size counting)

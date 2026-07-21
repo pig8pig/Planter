@@ -67,7 +67,7 @@ def main():
                 line = (
                     f"match {x} "
                     f"action extract_feature{n} "
-                    f"tree {code:08x}"
+                    f"tree H({int(code)})"
                 )
                 lines.append(line)
 
@@ -90,7 +90,7 @@ def main():
         line = (
             f"match {f0} {f1} {f2} {f3} "
             f"action read_lable "
-            f"label {int(leaf):08x}"
+            f"label N({int(leaf)})"
         )
         lines.append(line)
 

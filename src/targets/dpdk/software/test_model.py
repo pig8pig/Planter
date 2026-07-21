@@ -17,6 +17,7 @@
 import os
 import sys
 import json
+import struct
 import numpy as np
 from multiprocessing import Process
 from scapy.all import *
@@ -67,7 +68,14 @@ def read_results(output_pcap, n_expected, PlantedClass):
     with PcapReader(output_pcap) as reader:
         for pkt in reader:
             if PlantedClass in pkt:
-                results.append(int(pkt[PlantedClass].result))
+                raw = int(pkt[PlantedClass].result)
+                # Some targets emit decision labels in network order; convert
+                # only clearly byte-shifted 32-bit class IDs (e.g., 0x02000000).
+                if raw > 0xFF and (raw & 0x00FFFFFF) == 0:
+                    corrected = struct.unpack('>I', struct.pack('<I', raw))[0]
+                    results.append(corrected)
+                else:
+                    results.append(raw)
             else:
                 results.append(-1)
             if len(results) >= n_expected:
