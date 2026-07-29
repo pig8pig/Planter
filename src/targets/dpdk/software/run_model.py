@@ -94,13 +94,14 @@ def patch_spec_file(spec_path, entries_dir):
 
     # Fix 4: correct table sizes to match actual entry counts
     # (must satisfy n/4 = power of 2 for DPDK's hash bucket addressing)
-    table_entry_files = {
-        'lookup_feature0': 'lookup_feature0_entries.txt',
-        'lookup_feature1': 'lookup_feature1_entries.txt',
-        'lookup_feature2': 'lookup_feature2_entries.txt',
-        'lookup_feature3': 'lookup_feature3_entries.txt',
-        'decision':        'decision_entries.txt',
-    }
+    _cfg = json.load(open('src/configs/Planter_config.json'))
+    _model = _cfg.get('model config', {}).get('model', 'DT')
+    table_entry_files = {f'lookup_feature{n}': f'lookup_feature{n}_entries.txt' for n in range(4)}
+    if _model == 'RF':
+        _n_trees = _cfg.get('model config', {}).get('number of trees', 5)
+        for i in range(_n_trees):
+            table_entry_files[f'lookup_leaf_id{i}'] = f'lookup_leaf_id{i}_entries.txt'
+    table_entry_files['decision'] = 'decision_entries.txt'
     lines = spec.splitlines()
     for table_name, entry_file in table_entry_files.items():
         entry_path = os.path.join(entries_dir, entry_file)
@@ -137,12 +138,158 @@ def patch_spec_file(spec_path, entries_dir):
 
     spec = '\n'.join(lines) + '\n'
 
+    # Fix 5: Correct RF leaf table key extraction in spec.
+    # p4c-dpdk generates wrong shr/and amounts for bit-slice table keys.
+    # For tree 0 the spec copies the full packed code_fN with no masking;
+    # for trees 1-4 the shr offsets are computed incorrectly.
+    # We patch to extract exactly the right bits per (tree, feature) pair,
+    # matching the per-tree codes stored in Exact_Table['tree N'].
+    # NOTE: the apply-block in the spec uses a single tab (\t) for indentation.
+    if _model == 'RF' and 'width of code' in _cfg.get('p4 config', {}):
+        _woc       = _cfg['p4 config']['width of code']   # [tree][feature]
+        _n_trees_w = len(_woc)
+        _n_feats_w = len(_woc[0]) if _n_trees_w > 0 else 4
+
+        # --- tree 0: plain mov — insert AND mask to extract the correct bit slice ---
+        for _f in range(_n_feats_w):
+            _mask    = (1 << int(_woc[0][_f])) - 1
+            _key_reg = 'Ingress_key' if _f == 0 else f'Ingress_key_{_f - 1}'
+            _old = f'\tmov m.{_key_reg} m.local_metadata_code_f{_f}\n'
+            _new = f'\tmov m.{_key_reg} m.local_metadata_code_f{_f}\n\tand m.{_key_reg} 0x{_mask:x}\n'
+            spec = spec.replace(_old, _new, 1)
+
+        # --- trees 1-N: fix shr offset and AND mask in each 4-line key-prep block ---
+        # Pattern: mov tmp code_fF; shr tmp WRONG; and tmp WRONG_MASK; mov key_Y tmp
+        # key_Y register index (1-based from key_0) encodes (tree, feature):
+        #   reg_idx = key_number + 1  →  tree = reg_idx // n_features,  feat = reg_idx % n_features
+        def _fix_leaf_shr(m):
+            tmp_reg  = m.group(1)
+            feat_num = int(m.group(2))
+            key_full = m.group(3)
+            key_n_s  = m.group(4)          # numeric suffix of key reg, or None
+            if key_n_s is None:
+                return m.group(0)          # unnumbered key = tree 0, already handled
+            key_n    = int(key_n_s)
+            reg_idx  = key_n + 1           # Ingress_key_0 → reg 1
+            tree_n   = reg_idx // _n_feats_w
+            feat_f   = reg_idx % _n_feats_w
+            if tree_n < 1:
+                return m.group(0)
+            c_shr  = int(sum(_woc[T][feat_f] for T in range(tree_n)))
+            c_mask = (1 << int(_woc[tree_n][feat_f])) - 1
+            return (f'\tmov m.{tmp_reg} m.local_metadata_code_f{feat_num}\n'
+                    f'\tshr m.{tmp_reg} 0x{c_shr:x}\n'
+                    f'\tand m.{tmp_reg} 0x{c_mask:x}\n'
+                    f'\tmov m.{key_full} m.{tmp_reg}')
+
+        _leaf_key_pat = re.compile(
+            r'\tmov m\.(Ingress_tmp_?\d*) m\.local_metadata_code_f(\d+)\n'
+            r'\tshr m\.\1 0x[0-9a-f]+\n'
+            r'\tand m\.\1 0x[0-9a-f]+\n'
+            r'\tmov m\.(Ingress_key(?:_(\d+))?) m\.\1'
+        )
+        spec = _leaf_key_pat.sub(_fix_leaf_shr, spec)
+
     with open(spec_path, 'w') as f:
         f.write(spec)
     print(f"Patched spec written to {spec_path}")
 
+def generate_entry_files_rf(work_root, output_dir):
+    """Expand RF table JSON files into per-table entry files for dpdk-pipeline."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    config_path = os.path.join(work_root, 'src', 'configs', 'Planter_config.json')
+    with open(config_path) as f:
+        planter_config = json.load(f)
+    # width_of_code[tree][feature] — bit width allocated for each tree's code
+    # in each feature's packed metadata field (stored by the model generator)
+    width_of_code = planter_config['p4 config']['width of code']
+    n_trees = len(width_of_code)
+
+    ternary_json = os.path.join(work_root, 'Tables', 'Ternary_Table.json')
+    exact_json   = os.path.join(work_root, 'Tables', 'Exact_Table.json')
+    with open(ternary_json) as f:
+        ternary_table = json.load(f)
+    with open(exact_json) as f:
+        exact_table = json.load(f)
+
+    def covered_values(value, mask):
+        target = value & mask
+        return [x for x in range(256) if (x & value) == target]
+
+    def pack_codes(codes_list, feature_n):
+        """Pack per-tree codes into the single combined metadata value for feature_n.
+
+        Each tree's code occupies a contiguous bit slice of the combined field,
+        starting at the cumulative shift determined by the widths of all
+        preceding trees for this feature (matching the P4 key-slice layout).
+        """
+        packed = 0
+        shift = 0
+        for t in range(n_trees):
+            packed |= (int(codes_list[t]) << shift)
+            shift += int(width_of_code[t][feature_n])
+        return packed
+
+    # Feature lookup tables (ternary) — write the packed combined code
+    for n in range(4):
+        lines = []
+        seen = {}
+        for entry in ternary_table[f'feature {n}'].values():
+            value, mask, code_list = entry[0], entry[1], entry[2]
+            code = pack_codes(code_list, n)
+            for x in covered_values(value, mask):
+                if x not in seen:
+                    seen[x] = code
+                    lines.append(f"match {x} action extract_feature{n} tree H({code})")
+        out_path = os.path.join(output_dir, f'lookup_feature{n}_entries.txt')
+        with open(out_path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        print(f"  Wrote {len(lines)} entries -> {out_path}")
+
+    # Leaf lookup tables (exact) — one per tree
+    for n in range(n_trees):
+        lines = []
+        for entry in exact_table[f'tree {n}'].values():
+            f0   = entry['f0 code']
+            f1   = entry['f1 code']
+            f2   = entry['f2 code']
+            f3   = entry['f3 code']
+            leaf = entry['leaf']
+            lines.append(f"match {f0} {f1} {f2} {f3} action read_prob{n} prob H(0) vote H({int(leaf)})")
+        out_path = os.path.join(output_dir, f'lookup_leaf_id{n}_entries.txt')
+        with open(out_path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        print(f"  Wrote {len(lines)} entries -> {out_path}")
+
+    # Decision table
+    lines = []
+    for entry in exact_table['decision'].values():
+        t0  = entry['t0 vote']
+        t1  = entry['t1 vote']
+        t2  = entry['t2 vote']
+        t3  = entry['t3 vote']
+        t4  = entry['t4 vote']
+        cls = entry['class']
+        lines.append(f"match {t0} {t1} {t2} {t3} {t4} action read_lable label N({int(cls)})")
+    out_path = os.path.join(output_dir, 'decision_entries.txt')
+    with open(out_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f"  Wrote {len(lines)} entries -> {out_path}")
+
+
 def generate_entry_files(work_root, output_dir):
-    """Expand Ternary_Table.json into per-table exact-match entry files."""
+    """Expand table JSON files into per-table entry files for dpdk-pipeline."""
+    config_path = os.path.join(work_root, 'src', 'configs', 'Planter_config.json')
+    with open(config_path) as f:
+        planter_config = json.load(f)
+    model = planter_config.get('model config', {}).get('model', 'DT')
+
+    if model == 'RF':
+        generate_entry_files_rf(work_root, output_dir)
+        return
+
+    # DT path
     os.makedirs(output_dir, exist_ok=True)
     ternary_json = os.path.join(work_root, 'Tables', 'Ternary_Table.json')
     with open(ternary_json) as f:
@@ -180,19 +327,19 @@ def generate_entry_files(work_root, output_dir):
 
 
 def generate_cli_script(cli_path, spec_path, entries_dir,
-                         input_pcap, output_pcap):
+                         input_pcap, output_pcap, model='DT', n_trees=5):
     """Write the dpdk-pipeline CLI script."""
-    feature_tables = [
-        'lookup_feature0', 'lookup_feature1',
-        'lookup_feature2', 'lookup_feature3', 'decision'
-    ]
+    tables = [f'lookup_feature{n}' for n in range(4)]
+    if model == 'RF':
+        tables += [f'lookup_leaf_id{i}' for i in range(n_trees)]
+    tables.append('decision')
     with open(cli_path, 'w') as f:
         f.write("mempool MEMPOOL0 buffer 2304 pool 32K cache 256 cpu 0\n")
         f.write("pipeline PIPELINE0 create 0\n")
         f.write(f"pipeline PIPELINE0 port in 0 source MEMPOOL0 {input_pcap}\n")
         f.write(f"pipeline PIPELINE0 port out 0 sink {output_pcap}\n")
         f.write(f"pipeline PIPELINE0 build {spec_path}\n")
-        for table in feature_tables:
+        for table in tables:
             entry_file = os.path.join(entries_dir, f'{table}_entries.txt')
             f.write(f"pipeline PIPELINE0 table {table} update "
                     f"{entry_file} none none\n")
@@ -302,7 +449,10 @@ def add_make_run_model(fname, config):
 
     # Step 4 — generate CLI script
     print("Generating CLI script...")
-    generate_cli_script(cli_path, spec_path, entries_source_dir, input_pcap, output_pcap)
+    model = config['model config']['model']
+    n_trees = config['model config'].get('number of trees', 5)
+    generate_cli_script(cli_path, spec_path, entries_source_dir, input_pcap, output_pcap,
+                        model=model, n_trees=n_trees)
 
     # Store paths in config for test_model.py to use
     config['dpdk config'] = {
