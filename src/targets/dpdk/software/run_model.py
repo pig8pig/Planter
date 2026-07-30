@@ -55,11 +55,11 @@ def compile_p4_dpdk(p4_file, output_dir):
 
 
 def next_valid_size(n_entries):
-    """Smallest n where n/4 is a power of 2 and n >= n_entries."""
+    """Smallest n where n/4 is a power of 2, n >= n_entries, and n >= 8."""
     buckets = 1
     while buckets * 4 < n_entries:
         buckets *= 2
-    return buckets * 4
+    return max(buckets * 4, 8)
 
 
 def patch_spec_file(spec_path, entries_dir):
@@ -97,7 +97,7 @@ def patch_spec_file(spec_path, entries_dir):
     _cfg = json.load(open('src/configs/Planter_config.json'))
     _model = _cfg.get('model config', {}).get('model', 'DT')
     table_entry_files = {f'lookup_feature{n}': f'lookup_feature{n}_entries.txt' for n in range(4)}
-    if _model == 'RF':
+    if _model in ('RF', 'XGB'):
         _n_trees = _cfg.get('model config', {}).get('number of trees', 5)
         for i in range(_n_trees):
             table_entry_files[f'lookup_leaf_id{i}'] = f'lookup_leaf_id{i}_entries.txt'
@@ -145,17 +145,19 @@ def patch_spec_file(spec_path, entries_dir):
     # We patch to extract exactly the right bits per (tree, feature) pair,
     # matching the per-tree codes stored in Exact_Table['tree N'].
     # NOTE: the apply-block in the spec uses a single tab (\t) for indentation.
-    if _model == 'RF' and 'width of code' in _cfg.get('p4 config', {}):
+    if _model in ('RF', 'XGB') and 'width of code' in _cfg.get('p4 config', {}):
         _woc       = _cfg['p4 config']['width of code']   # [tree][feature]
         _n_trees_w = len(_woc)
         _n_feats_w = len(_woc[0]) if _n_trees_w > 0 else 4
 
-        # --- tree 0: plain mov — insert AND mask to extract the correct bit slice ---
+        # --- tree 0: plain mov — add masking via Ingress_tmp (same pattern as trees 1-N) ---
         for _f in range(_n_feats_w):
             _mask    = (1 << int(_woc[0][_f])) - 1
             _key_reg = 'Ingress_key' if _f == 0 else f'Ingress_key_{_f - 1}'
             _old = f'\tmov m.{_key_reg} m.local_metadata_code_f{_f}\n'
-            _new = f'\tmov m.{_key_reg} m.local_metadata_code_f{_f}\n\tand m.{_key_reg} 0x{_mask:x}\n'
+            _new = (f'\tmov m.Ingress_tmp m.local_metadata_code_f{_f}\n'
+                    f'\tand m.Ingress_tmp 0x{_mask:x}\n'
+                    f'\tmov m.{_key_reg} m.Ingress_tmp\n')
             spec = spec.replace(_old, _new, 1)
 
         # --- trees 1-N: fix shr offset and AND mask in each 4-line key-prep block ---
@@ -189,6 +191,28 @@ def patch_spec_file(spec_path, entries_dir):
             r'\tmov m\.(Ingress_key(?:_(\d+))?) m\.\1'
         )
         spec = _leaf_key_pat.sub(_fix_leaf_shr, spec)
+
+    # Fix 6: Align 32-bit scratch registers to 4-byte boundaries.
+    # A trailing bit<8> field (e.g. local_metadata_flag) can leave the
+    # Ingress_tmp / Ingress_key registers at offset%4 == 2, causing a
+    # SIGBUS on ARM when the DPDK executor performs aligned 32-bit loads.
+    # Insert bit<8> padding fields (never bit<16> — unsupported by DPDK 20.11)
+    # before the first Ingress_tmp to reach the next 4-byte boundary.
+    _first_tmp = spec.find('\n\tbit<32> Ingress_tmp\n')
+    if _first_tmp != -1:
+        # Compute byte offset of Ingress_tmp in the metadata struct
+        _ms = spec.find('struct metadata_t {')
+        _fragment = spec[_ms:_first_tmp]
+        _offset = 0
+        for _fl in _fragment.split('\n'):
+            _fm = re.match(r'\s+bit<(\d+)>', _fl)
+            if _fm:
+                _offset += (int(_fm.group(1)) + 7) // 8
+        _pad = (-_offset) % 4            # bytes needed to reach next 4-byte boundary
+        if _pad > 0:
+            # Use bit<8> fields only — DPDK 20.11 doesn't support bit<16>
+            _pad_decl = ''.join(f'\n\tbit<8> _planter_align_pad_{i}' for i in range(_pad))
+            spec = spec[:_first_tmp] + _pad_decl + spec[_first_tmp:]
 
     with open(spec_path, 'w') as f:
         f.write(spec)
@@ -262,16 +286,12 @@ def generate_entry_files_rf(work_root, output_dir):
             f.write('\n'.join(lines) + '\n')
         print(f"  Wrote {len(lines)} entries -> {out_path}")
 
-    # Decision table
+    # Decision table — dynamic so it works for any number of trees
     lines = []
     for entry in exact_table['decision'].values():
-        t0  = entry['t0 vote']
-        t1  = entry['t1 vote']
-        t2  = entry['t2 vote']
-        t3  = entry['t3 vote']
-        t4  = entry['t4 vote']
-        cls = entry['class']
-        lines.append(f"match {t0} {t1} {t2} {t3} {t4} action read_lable label N({int(cls)})")
+        votes = ' '.join(str(entry[f't{i} vote']) for i in range(n_trees))
+        cls   = entry['class']
+        lines.append(f"match {votes} action read_lable label N({int(cls)})")
     out_path = os.path.join(output_dir, 'decision_entries.txt')
     with open(out_path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
@@ -285,7 +305,7 @@ def generate_entry_files(work_root, output_dir):
         planter_config = json.load(f)
     model = planter_config.get('model config', {}).get('model', 'DT')
 
-    if model == 'RF':
+    if model in ('RF', 'XGB'):
         generate_entry_files_rf(work_root, output_dir)
         return
 
@@ -330,7 +350,7 @@ def generate_cli_script(cli_path, spec_path, entries_dir,
                          input_pcap, output_pcap, model='DT', n_trees=5):
     """Write the dpdk-pipeline CLI script."""
     tables = [f'lookup_feature{n}' for n in range(4)]
-    if model == 'RF':
+    if model in ('RF', 'XGB'):
         tables += [f'lookup_leaf_id{i}' for i in range(n_trees)]
     tables.append('decision')
     with open(cli_path, 'w') as f:
@@ -383,6 +403,8 @@ def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, output_pcap=None, tim
         with open(log_path, 'w') as f:
             f.write(log_output)
         if result.returncode != 0 or has_cli_table_errors(log_output):
+            if result.returncode != 0:
+                log_output = f'[DPDK exit code: {result.returncode}]\n' + log_output
             return False, log_output
         return True, log_output
     except sub.TimeoutExpired as e:
@@ -411,13 +433,12 @@ def add_make_run_model(fname, config):
 
     p4_file = os.path.join(work_root, 'P4', file_name + '.p4')
 
-    required_entry_files = [
-        'lookup_feature0_entries.txt',
-        'lookup_feature1_entries.txt',
-        'lookup_feature2_entries.txt',
-        'lookup_feature3_entries.txt',
-        'decision_entries.txt',
-    ]
+    _model_name  = config['model config']['model']
+    _n_trees_req = config['model config'].get('number of trees', 5)
+    required_entry_files = [f'lookup_feature{n}_entries.txt' for n in range(4)]
+    if _model_name in ('RF', 'XGB'):
+        required_entry_files += [f'lookup_leaf_id{i}_entries.txt' for i in range(_n_trees_req)]
+    required_entry_files.append('decision_entries.txt')
     manual_entries_available = all(
         os.path.exists(os.path.join(manual_entries_dir, name))
         for name in required_entry_files

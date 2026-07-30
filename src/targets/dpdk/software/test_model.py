@@ -116,7 +116,7 @@ def main(sklearn_test_y, test_X, test_y, processes, if_using_subprocess):
 
     # Step 2 — run the DPDK pipeline (reads input pcap, writes output pcap)
     print("Running DPDK pipeline...")
-    success, log = run_dpdk_pipeline(cli_path, pipeline_bin, log_path, output_pcap=output_pcap, timeout=15)
+    success, log = run_dpdk_pipeline(cli_path, pipeline_bin, log_path, output_pcap=output_pcap, timeout=90)
     if not success:
         print(f"Pipeline failed:\n{log}")
         return processes, if_using_subprocess
