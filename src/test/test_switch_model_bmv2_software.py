@@ -26,8 +26,8 @@ from multiprocessing import *
 import readline
 import time
 import os
-print('Predicted load table time ... (0.008s)')
-time.sleep(0.008)
+print('Predicted load table time ... (0.009s)')
+time.sleep(0.009)
 class Planter(Packet):
     name = 'Planter'
     fields_desc = [StrFixedLenField('P', 'P', length=1),

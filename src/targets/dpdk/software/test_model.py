@@ -157,6 +157,10 @@ def main(sklearn_test_y, test_X, test_y, processes, if_using_subprocess):
     if not if_using_subprocess:
         if_using_subprocess = True
 
+    # Clean up large output pcap to prevent disk full
+    import subprocess
+    subprocess.run(['sudo', 'rm', '-f', output_pcap], capture_output=True)
+
     return processes, if_using_subprocess
 
 

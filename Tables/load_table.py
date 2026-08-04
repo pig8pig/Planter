@@ -29,7 +29,7 @@ table = json.load(open('./Tables/Ternary_Table.json','r'))
 Planter_config = json.load(open('./src/configs/Planter_config.json','r'))
 config = Planter_config['p4 config']
 
-Ingress = bfrt.RF_performance_Iris.pipe.SwitchIngress
+Ingress = bfrt.DT_performance_Iris.pipe.SwitchIngress
 Ingress.clear()
 
 def ten_to_bin(num, count):
@@ -43,45 +43,26 @@ print('load feature 0 table with',len(table['feature 0'].keys()),'entries')
 for k in range(len(table['feature 0'].keys())):
     key = str(k)
     codes = ''
-    for tree in range(config['number of trees']):
-        codes = ten_to_bin(int(table['feature 0'][key][2][tree]), int(config['width of code'][tree][0])) + codes
+    codes = ten_to_bin(int(table['feature 0'][key][2]), int(config['width of code'][0])) + codes
     Ingress.lookup_feature0.add_with_extract_feature0(table['feature 0'][key][1], table['feature 0'][key][0], int(key), int(codes,2))
 print('load feature 1 table with',len(table['feature 1'].keys()),'entries')
 for k in range(len(table['feature 1'].keys())):
     key = str(k)
     codes = ''
-    for tree in range(config['number of trees']):
-        codes = ten_to_bin(int(table['feature 1'][key][2][tree]), int(config['width of code'][tree][1])) + codes
+    codes = ten_to_bin(int(table['feature 1'][key][2]), int(config['width of code'][1])) + codes
     Ingress.lookup_feature1.add_with_extract_feature1(table['feature 1'][key][1], table['feature 1'][key][0], int(key), int(codes,2))
 print('load feature 2 table with',len(table['feature 2'].keys()),'entries')
 for k in range(len(table['feature 2'].keys())):
     key = str(k)
     codes = ''
-    for tree in range(config['number of trees']):
-        codes = ten_to_bin(int(table['feature 2'][key][2][tree]), int(config['width of code'][tree][2])) + codes
+    codes = ten_to_bin(int(table['feature 2'][key][2]), int(config['width of code'][2])) + codes
     Ingress.lookup_feature2.add_with_extract_feature2(table['feature 2'][key][1], table['feature 2'][key][0], int(key), int(codes,2))
 print('load feature 3 table with',len(table['feature 3'].keys()),'entries')
 for k in range(len(table['feature 3'].keys())):
     key = str(k)
     codes = ''
-    for tree in range(config['number of trees']):
-        codes = ten_to_bin(int(table['feature 3'][key][2][tree]), int(config['width of code'][tree][3])) + codes
+    codes = ten_to_bin(int(table['feature 3'][key][2]), int(config['width of code'][3])) + codes
     Ingress.lookup_feature3.add_with_extract_feature3(table['feature 3'][key][1], table['feature 3'][key][0], int(key), int(codes,2))
-print('load tree (code/code to vote) 0 table with',len(table['tree 0'].keys()),'entries')
-for key in table['tree 0']:
-    Ingress.lookup_leaf_id0.add_with_read_prob0(table['tree 0'][key]['f0 code'], table['tree 0'][key]['f1 code'], table['tree 0'][key]['f2 code'], table['tree 0'][key]['f3 code'], 0, table['tree 0'][key]['leaf'])
-print('load tree (code/code to vote) 1 table with',len(table['tree 1'].keys()),'entries')
-for key in table['tree 1']:
-    Ingress.lookup_leaf_id1.add_with_read_prob1(table['tree 1'][key]['f0 code'], table['tree 1'][key]['f1 code'], table['tree 1'][key]['f2 code'], table['tree 1'][key]['f3 code'], 0, table['tree 1'][key]['leaf'])
-print('load tree (code/code to vote) 2 table with',len(table['tree 2'].keys()),'entries')
-for key in table['tree 2']:
-    Ingress.lookup_leaf_id2.add_with_read_prob2(table['tree 2'][key]['f0 code'], table['tree 2'][key]['f1 code'], table['tree 2'][key]['f2 code'], table['tree 2'][key]['f3 code'], 0, table['tree 2'][key]['leaf'])
-print('load tree (code/code to vote) 3 table with',len(table['tree 3'].keys()),'entries')
-for key in table['tree 3']:
-    Ingress.lookup_leaf_id3.add_with_read_prob3(table['tree 3'][key]['f0 code'], table['tree 3'][key]['f1 code'], table['tree 3'][key]['f2 code'], table['tree 3'][key]['f3 code'], 0, table['tree 3'][key]['leaf'])
-print('load tree (code/code to vote) 4 table with',len(table['tree 4'].keys()),'entries')
-for key in table['tree 4']:
-    Ingress.lookup_leaf_id4.add_with_read_prob4(table['tree 4'][key]['f0 code'], table['tree 4'][key]['f1 code'], table['tree 4'][key]['f2 code'], table['tree 4'][key]['f3 code'], 0, table['tree 4'][key]['leaf'])
-print('load vote to class (decision) table with',len(table['decision'].keys()),'entries')
-for key in table['decision']:
-    Ingress.decision.add_with_read_lable(table['decision'][key]['t0 vote'], table['decision'][key]['t1 vote'], table['decision'][key]['t2 vote'], table['decision'][key]['t3 vote'], table['decision'][key]['t4 vote'], table['decision'][key]['class'])
+print('load tree (code/code to vote) table with',len(table['code to vote'].keys()),'entries')
+for key in table['code to vote']:
+    Ingress.decision.add_with_read_lable(table['code to vote'][key]['f0 code'], table['code to vote'][key]['f1 code'], table['code to vote'][key]['f2 code'], table['code to vote'][key]['f3 code'],  int(table['code to vote'][key]['leaf']))
