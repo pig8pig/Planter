@@ -37,28 +37,8 @@ sudo pip3 install numpy scikit-learn  # also needed under sudo for mininet
 echo "      OK"
 echo ""
 
-# Step 3 — Configure hugepages (persistent across reboots)
-echo "[3/6] Configuring hugepages..."
-sudo mkdir -p /mnt/huge
-sudo mount -t hugetlbfs nodev /mnt/huge 2>/dev/null || true
-echo 64 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages > /dev/null
-
-# Make permanent via rc.local
-if ! grep -q "nr_hugepages" /etc/rc.local 2>/dev/null; then
-    sudo tee /etc/rc.local > /dev/null <<'EOF'
-#!/bin/bash
-mkdir -p /mnt/huge
-mount -t hugetlbfs nodev /mnt/huge
-echo 64 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-exit 0
-EOF
-    sudo chmod +x /etc/rc.local
-fi
-echo "      OK — 64 x 2MB hugepages allocated (persistent)"
-echo ""
-
-# Step 4 — Build dpdk-pipeline binary
-echo "[4/6] Building dpdk-pipeline binary..."
+# Step 3 — Build dpdk-pipeline binary
+echo "[3/6] Building dpdk-pipeline binary..."
 if [ ! -f "$PIPELINE_BUILD_DIR/build/pipeline" ]; then
     cp -r /usr/share/dpdk/examples/pipeline "$PIPELINE_BUILD_DIR"
     cd "$PIPELINE_BUILD_DIR"
@@ -75,15 +55,15 @@ else
 fi
 echo ""
 
-# Step 5 — Planter git setup
-echo "[5/6] Configuring Planter git..."
+# Step 4 — Planter git setup
+echo "[4/6] Configuring Planter git..."
 cd "$PLANTER_DIR"
 git config core.autocrlf input
 echo "      OK"
 echo ""
 
-# Step 6 — Fix BMv2 Makefile Python path
-echo "[6/6] Applying P4Pi compatibility fixes..."
+# Step 5 — Fix BMv2 Makefile Python path
+echo "[5/6] Applying P4Pi compatibility fixes..."
 MAKEFILE="$PLANTER_DIR/src/targets/bmv2/software/utils/Makefile"
 if grep -q "python3.12" "$MAKEFILE"; then
     sed -i 's|/usr/local/lib/python3.12/site-packages|/usr/lib/python3/dist-packages|g' "$MAKEFILE"
