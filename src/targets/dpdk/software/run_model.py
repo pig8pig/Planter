@@ -371,7 +371,7 @@ def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, output_pcap=None, tim
     Launch dpdk-pipeline, wait for it to process packets, capture log.
     Returns (success, log_output)
     """
-    cmd = ['sudo', pipeline_binary, '-c', '0x3', '--', '-s', cli_path]
+    cmd = ['sudo', pipeline_binary, '--no-huge', '-m', '256', '-c', '0x3', '--', '-s', cli_path]
     output_pcap = None
 
     def has_cli_table_errors(log_text):
