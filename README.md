@@ -3,6 +3,20 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 ![GitHub release](https://img.shields.io/badge/release%20tag-v0.1.0-orange)
 
+---
+
+> ### 🌱 This branch: `p4c-dpdk` target (GSoC 2026)
+>
+> This is a fork of Planter adding a **`p4c-dpdk` target**, enabling trained
+> models to run as DPDK SWX pipelines on [P4Pi](https://github.com/p4lang/p4pi).
+>
+> Google Summer of Code 2026 · Project 3.3 · The P4 Language Consortium
+> Contributor: Yuzhong (WeiWei) Luo · Mentor: Dr Peng Qian
+>
+> **See [`DPDK_TARGET.md`](./DPDK_TARGET.md) for setup, usage, results and known issues.**
+
+---
+
 ## Introducing Planter
 Planter is a modular framework for realizing one-click in-network machine learning algorithms. All you need to provide to Planter is a configuration file (```Name_data.py```) and a dataset. Planter will take it from there and offload your machine learning classification task into a programmable data plane. This is the artifact for the paper "[Planter: Rapid Prototyping of In-Network Machine Learning Inference](https://eng.ox.ac.uk/media/zetja3ek/zheng24planter.pdf)" in SIGCOMM CCR [[video]](https://www.youtube.com/watch?v=ZVXNpUwgSi0) (with an early arXiv version named "[Automating In-Network Machine Learning](https://arxiv.org/pdf/2205.08824.pdf)".) 
 
