@@ -1,29 +1,28 @@
-# Planter — p4c-dpdk Target (GSoC 2026)
+# p4c-dpdk Target for Planter
 
-This branch adds a **`p4c-dpdk` target** to [Planter](https://github.com/In-Network-Machine-Learning/Planter),
-allowing trained machine-learning models to be compiled and executed as DPDK SWX
-pipelines on [P4Pi](https://github.com/p4lang/p4pi).
+Documentation for the `p4c-dpdk` target added on the `gsoc-p4c-dpdk` branch.
+For general Planter documentation, see the [main README](./README.md).
 
 Google Summer of Code 2026 · Project 3.3 · The P4 Language Consortium
 Contributor: Yuzhong (WeiWei) Luo · Mentor: Dr Peng Qian · University of Oxford
 
 ---
 
-## What this adds
+## Overview
 
 Planter converts trained scikit-learn models into P4 programs and match–action
-table entries, then deploys them to a target. Before this work its low-cost
-options ended at BMv2, which is well suited to functional validation but not to
-sustained traffic. This branch adds the missing path to `p4c-dpdk`, so the same
-generated model can run on DPDK's SWX software pipeline.
+table entries, then deploys them to a target. Its low-cost options previously
+ended at BMv2, which suits functional validation but not sustained traffic. This
+branch adds the missing path to `p4c-dpdk`, so the same generated model can run
+on DPDK's SWX software pipeline on [P4Pi](https://github.com/p4lang/p4pi).
 
-Three things are contributed:
+Three contributions:
 
 1. **A `p4c-dpdk` target adapter** — `src/targets/dpdk/software/`
 2. **Fixes to Planter's PSA architecture generator** — `src/architectures/psa/`,
    which had not previously been validated for ML model generation
-3. **A P4Pi image build overlay** — `image-build/`, which rebuilds the P4Pi
-   image with Planter preinstalled
+3. **A P4Pi image build overlay** — `image-build/`, rebuilding the P4Pi image
+   with Planter preinstalled
 
 ---
 
@@ -39,7 +38,7 @@ chmod +x setup.sh && ./setup.sh      # dependencies + dpdk-pipeline build
 python3 Planter.py -m
 ```
 
-At the prompts choose:
+At the prompts:
 
 | Prompt | Value |
 |---|---|
@@ -51,8 +50,8 @@ At the prompts choose:
 | Mode | `software` |
 
 The run trains the model, generates PSA P4, compiles it with `p4c-dpdk`, patches
-the resulting `.spec`, writes table entry files, launches `dpdk-pipeline`, and
-reports classification accuracy against the scikit-learn baseline.
+the `.spec`, writes table entry files, launches `dpdk-pipeline`, and reports
+accuracy against the scikit-learn baseline.
 
 ---
 
@@ -65,8 +64,8 @@ Iris, 70/30 split, Raspberry Pi 4, DPDK 20.11.5:
 | Decision Tree (depth 4) | 95.56% | 95.56% | **95.56%** |
 | Random Forest (5 trees, depth 4) | 93.33% | 93.33% | **91.11%** |
 
-Decision Tree matches the BMv2 baseline exactly. The Random Forest gap is a
-known coverage bug in the entry expansion — see *Known issues* below.
+Decision Tree matches the BMv2 baseline exactly. The Random Forest gap is a known
+coverage bug — see [Known issues](#known-issues).
 
 ---
 
@@ -90,9 +89,8 @@ accuracy.
 
 ## PSA generator fixes
 
-Planter's `src/architectures/psa/p4_generator.py` existed but had not been
-exercised for ML model generation, and its output did not compile. Eight fixes
-were required:
+`src/architectures/psa/p4_generator.py` existed but had not been exercised for ML
+model generation, and its output did not compile. Eight fixes were required:
 
 1. Missing `struct metadata_t {}` wrapper — metadata fields were emitted at file
    top level
@@ -127,8 +125,8 @@ runtime are not documented upstream; `patch_spec_file()` works around each:
 | `n_pkts_max` uninitialised in the `dpdk-pipeline` sample app | Patch `cli.c` to set `n_pkts_max = 0` |
 
 Several of these no longer apply on newer DPDK releases. `--no-huge` is used
-throughout, which removes the hugepage reservation step that would otherwise
-need reapplying after every reboot.
+throughout, removing the hugepage reservation step that would otherwise need
+reapplying after every reboot.
 
 ---
 
@@ -145,8 +143,8 @@ Each includes a README written for classroom use.
 
 ## P4Pi image build
 
-`image-build/` rebuilds the P4Pi image with Planter, `p4c`, BMv2 and
-`dpdk-pipeline` preinstalled, so no setup is needed after flashing.
+[`image-build/`](image-build/) rebuilds the P4Pi image with Planter, `p4c`, BMv2
+and `dpdk-pipeline` preinstalled, so no setup is needed after flashing.
 
 This was necessary because the original P4Pi build depends on OpenSUSE OBS
 repositories that no longer exist:
@@ -156,10 +154,10 @@ $ curl https://api.opensuse.org/public/build/home:p4pi
 <status code="unknown_project">Project not found: home:p4pi</status>
 ```
 
-The overlay replaces those package sources with builds from pinned upstream
-tags — p4c v1.2.5.16 and BMv2 1.15.5, with the BMv2 and DPDK backends enabled.
-See [`image-build/README.md`](image-build/README.md) for the build procedure and
-the cross-build issues encountered.
+The overlay replaces those package sources with builds from pinned upstream tags
+— p4c v1.2.5.16 and BMv2 1.15.5, with the BMv2 and DPDK backends enabled. See
+[`image-build/README.md`](image-build/README.md) for the build procedure and the
+cross-build issues encountered.
 
 ---
 
@@ -180,15 +178,16 @@ the cross-build issues encountered.
 
 ---
 
-## Repository layout
+## Files added or modified
 
 ```
-src/targets/dpdk/software/     p4c-dpdk target adapter
+src/targets/dpdk/software/     p4c-dpdk target adapter (new)
 src/architectures/psa/         PSA generator (fixed)
-examples/                      Example applications
-image-build/                   P4Pi image build overlay
+src/targets/bmv2/software/     Architecture-aware compiler selection (fixed)
+examples/                      Example applications (new)
+image-build/                   P4Pi image build overlay (new)
 scripts/                       Ternary-to-exact-match conversion utility
-setup.sh                       One-command environment setup
+setup.sh                       One-command environment setup (new)
 ```
 
 ---
@@ -200,7 +199,3 @@ setup.sh                       One-command environment setup
 - PSA generator fixes and the DPDK target: PRs to
   [Planter](https://github.com/In-Network-Machine-Learning/Planter) to follow
 - Image build fixes: PR to [P4Pi](https://github.com/p4lang/p4pi) to follow
-
-## Licence
-
-Apache-2.0, as per upstream Planter.
