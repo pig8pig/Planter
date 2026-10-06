@@ -102,7 +102,9 @@ def main(sklearn_test_y, test_X, test_y, processes, if_using_subprocess):
     num_features = Planter_config['data config']['number of features']
     dpdk         = Planter_config.get('dpdk config', {})
 
-    input_pcap   = os.path.join(model_test_root, 'test_input.pcap')
+    # On DPDK 21.08+ the pcaps live in a short run directory because every
+    # token in the .io port spec must be under RTE_SWX_NAME_SIZE (64) chars.
+    input_pcap   = dpdk.get('input_pcap',   os.path.join(model_test_root, 'test_input.pcap'))
     output_pcap  = dpdk.get('output_pcap',  os.path.join(model_test_root, 'test_output.pcap'))
     log_path     = dpdk.get('log_path',     os.path.join(model_test_root, 'run.log'))
     cli_path     = dpdk.get('cli_path',     os.path.join(model_test_root, 'run.cli'))
@@ -123,6 +125,13 @@ def main(sklearn_test_y, test_X, test_y, processes, if_using_subprocess):
 
     # Step 3 — read classifications out of the output pcap
     print("Reading output pcap...")
+    if not os.path.exists(output_pcap) or os.path.getsize(output_pcap) == 0:
+        print(f"Pipeline produced no output packets ({output_pcap} is empty).\n"
+              "Every packet was dropped before reaching the sink port — check "
+              "that the spec's LABEL_DROP body transmits rather than drops, "
+              "since the Planter P4 never clears psa_ingress_output_metadata_drop.\n"
+              f"Pipeline log:\n{log}")
+        return processes, if_using_subprocess
     switch_test_y = read_results(output_pcap, n, PlantedClass)
 
     if len(switch_test_y) < n:
@@ -158,8 +167,10 @@ def main(sklearn_test_y, test_X, test_y, processes, if_using_subprocess):
         if_using_subprocess = True
 
     # Clean up large output pcap to prevent disk full
-    import subprocess
-    subprocess.run(['sudo', 'rm', '-f', output_pcap], capture_output=True)
+    try:
+        os.remove(output_pcap)
+    except OSError:
+        pass
 
     return processes, if_using_subprocess
 

@@ -1,16 +1,11 @@
-mempool MEMPOOL0 buffer 2304 pool 32K cache 256 cpu 0
-pipeline PIPELINE0 create 0
-pipeline PIPELINE0 port in 0 source MEMPOOL0 /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/test_input.pcap
-pipeline PIPELINE0 port out 0 sink /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/test_output.pcap
-pipeline PIPELINE0 build /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/spec/RF_performance_Iris.spec
-pipeline PIPELINE0 table lookup_feature0 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature0_entries.txt none none
-pipeline PIPELINE0 table lookup_feature1 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature1_entries.txt none none
-pipeline PIPELINE0 table lookup_feature2 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature2_entries.txt none none
-pipeline PIPELINE0 table lookup_feature3 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature3_entries.txt none none
-pipeline PIPELINE0 table lookup_leaf_id0 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_leaf_id0_entries.txt none none
-pipeline PIPELINE0 table lookup_leaf_id1 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_leaf_id1_entries.txt none none
-pipeline PIPELINE0 table lookup_leaf_id2 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_leaf_id2_entries.txt none none
-pipeline PIPELINE0 table lookup_leaf_id3 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_leaf_id3_entries.txt none none
-pipeline PIPELINE0 table lookup_leaf_id4 update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_leaf_id4_entries.txt none none
-pipeline PIPELINE0 table decision update /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/decision_entries.txt none none
-thread 1 pipeline PIPELINE0 enable
+mempool MEMPOOL0 meta 0 pkt 2176 pool 32K cache 256 numa 0
+pipeline codegen /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/spec/DT_performance_Iris.spec /home/pi/.planter_dpdk/p.c
+pipeline libbuild /home/pi/.planter_dpdk/p.c /home/pi/.planter_dpdk/p.so
+pipeline PIPELINE0 build lib /home/pi/.planter_dpdk/p.so io /home/pi/.planter_dpdk/p.io numa 0
+pipeline PIPELINE0 table lookup_feature0 add /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature0_entries.txt
+pipeline PIPELINE0 table lookup_feature1 add /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature1_entries.txt
+pipeline PIPELINE0 table lookup_feature2 add /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature2_entries.txt
+pipeline PIPELINE0 table lookup_feature3 add /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/lookup_feature3_entries.txt
+pipeline PIPELINE0 table decision add /home/pi/Planter/src/targets/dpdk/software/model_test/test_environment/entries/decision_entries.txt
+pipeline PIPELINE0 commit
+pipeline PIPELINE0 enable thread 1

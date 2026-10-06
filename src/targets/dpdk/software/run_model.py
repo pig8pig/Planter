@@ -15,8 +15,10 @@
 # Date: 2026-06-24
 
 import os
+import re
 import sys
 import stat
+import shutil
 import subprocess as sub
 import json
 import time
@@ -42,8 +44,9 @@ def compile_p4_dpdk(p4_file, output_dir):
     """Compile P4 file with p4c-dpdk. Returns (success, spec_path, error)."""
     os.makedirs(output_dir, exist_ok=True)
     cmd = ['p4c', '--target', 'dpdk', '--arch', 'psa', p4_file, '-o', output_dir]
-    sub.run(['sudo', 'killall', 'pipeline'], capture_output=True)
-    sub.run(['sudo', 'rm', '-rf', '/var/run/dpdk/rte/'], capture_output=True)
+    # The pipeline app runs unprivileged (--no-huge), so no sudo is needed to
+    # clear a previous run.
+    sub.run(['pkill', '-x', 'pipeline'], capture_output=True)
     result = sub.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return False, None, result.stderr
@@ -62,35 +65,127 @@ def next_valid_size(n_entries):
     return max(buckets * 4, 8)
 
 
-def patch_spec_file(spec_path, entries_dir):
-    """Apply DPDK 20.11 workarounds to the compiled .spec file."""
+# ---------------------------------------------------------------------------
+# DPDK version handling
+#
+# DPDK 20.11 had no wildcard (ternary) table backend in the SWX pipeline:
+# mask parsing in the spec was a literal /* TBD */ stub.  Ternary match was
+# added in 21.08 (lib/table/rte_swx_table_wm.c, ACL-backed), so from 21.08
+# onwards Planter's ternary feature tables can be emitted natively instead of
+# being expanded into an exact-match entry per covered key value.
+#
+# Two further incompatibilities matter for entry/CLI generation:
+#   * 20.11 wrapped action arguments as H(x)/N(x) to select host/network byte
+#     order.  21.08+ dropped that syntax: rte_swx_ctl.c parses the argument
+#     with strtoull() and rejects any trailing characters, deriving byte order
+#     from the action field itself.  H(0) is a hard parse error there.
+#   * 20.11 built a pipeline straight from the .spec.  21.08+ splits this into
+#     codegen -> libbuild -> "build lib <so> io <io> numa <n>", with the port
+#     configuration moved out of the CLI into a separate .io spec file.
+# ---------------------------------------------------------------------------
+
+DPDK_NATIVE_TERNARY_MIN = (21, 8)
+
+
+def detect_dpdk_version(config=None):
+    """Return the target DPDK version as an (major, minor) tuple.
+
+    Order of precedence: explicit config override, then pkg-config, then a
+    conservative 20.11 fallback so unknown environments keep the old
+    behaviour.
+    """
+    raw = None
+    if config:
+        raw = config.get('dpdk config', {}).get('version')
+    if not raw:
+        raw = os.environ.get('PLANTER_DPDK_VERSION')
+    if not raw:
+        try:
+            res = sub.run(['pkg-config', '--modversion', 'libdpdk'],
+                          capture_output=True, text=True)
+            if res.returncode == 0:
+                raw = res.stdout.strip()
+        except Exception:
+            raw = None
+    if not raw:
+        return (20, 11)
+    parts = re.findall(r'\d+', str(raw))
+    if len(parts) < 2:
+        return (20, 11)
+    return (int(parts[0]), int(parts[1]))
+
+
+def uses_native_ternary(version):
+    """True when this DPDK has a wildcard/ternary SWX table backend."""
+    return tuple(version) >= DPDK_NATIVE_TERNARY_MIN
+
+
+def fmt_action_arg(value, wrapper, native):
+    """Format an action argument for the table entries file.
+
+    ``wrapper`` is the DPDK 20.11 byte-order wrapper letter ('H' or 'N').
+    On 21.08+ the wrapper was removed and a bare integer is required.
+    """
+    value = int(value)
+    return str(value) if native else f'{wrapper}({value})'
+
+
+def patch_spec_file(spec_path, entries_dir, native_ternary=False):
+    """Apply the workarounds the compiled .spec needs to run under Planter.
+
+    Fixes 1-2 cover features missing in DPDK 20.11 (wildcard tables, the
+    lookahead instruction) and are skipped on 21.08+, which has both.  Fixes
+    3-6 apply to every version; fix 3 additionally rewrites the unreachable
+    LABEL_DROP body on 20.11, which has no drop instruction to parse.
+    """
     with open(spec_path, 'r') as f:
         spec = f.read()
 
-    # Fix 1: wildcard -> exact (DPDK 20.11 has no wildcard table backend)
-    spec = spec.replace(' wildcard', ' exact')
+    if not native_ternary:
+        # Fix 1: wildcard -> exact (DPDK 20.11 has no wildcard table backend)
+        spec = spec.replace(' wildcard', ' exact')
 
-    # Fix 2: remove lookahead block (instruction doesn't exist in DPDK 20.11)
-    import re
-    lookahead_pattern = re.compile(
-        r'(SWITCHINGRESSPARSER_CHECK_PLANTER_VERSION\s*:\s*)lookahead.*?'
-        r'jmp SWITCHINGRESSPARSER_ACCEPT\n',
-        re.DOTALL
-    )
-    spec = lookahead_pattern.sub(
-        r'\1jmp SWITCHINGRESSPARSER_PARSE_PLANTER\n',
-        spec
+        # Fix 2: remove lookahead block (instruction doesn't exist in DPDK 20.11)
+        lookahead_pattern = re.compile(
+            r'(SWITCHINGRESSPARSER_CHECK_PLANTER_VERSION\s*:\s*)lookahead.*?'
+            r'jmp SWITCHINGRESSPARSER_ACCEPT\n',
+            re.DOTALL
+        )
+        spec = lookahead_pattern.sub(
+            r'\1jmp SWITCHINGRESSPARSER_PARSE_PLANTER\n',
+            spec
+        )
+
+
+    # Fix 3: never take the drop branch.
+    #
+    # p4c-dpdk opens the PSA apply block with
+    #     mov m.psa_ingress_output_metadata_drop 0x1
+    # (PSA drops by default) and the Planter P4 has no action that clears the
+    # flag, so the trailing
+    #     jmpneq LABEL_DROP m.psa_ingress_output_metadata_drop 0x0
+    # always jumps.  That skips the two emit instructions, so rewriting
+    # LABEL_DROP's body to tx (the old DPDK 20.11 workaround) transmits a
+    # zero-length packet rather than the classified one — the parser extracted
+    # the headers and nothing put them back.  Clearing the flag instead lets
+    # the normal "emit h.ethernet; emit h.Planter; tx" path run, which is what
+    # this use case wants: every packet comes back carrying its result field.
+    spec = spec.replace(
+        'mov m.psa_ingress_output_metadata_drop 0x1',
+        'mov m.psa_ingress_output_metadata_drop 0x0'
     )
 
-    # Fix 3: drop -> tx (drop instruction doesn't exist in DPDK 20.11)
-    spec = spec.replace(
-        'LABEL_DROP :\tdrop',
-        'LABEL_DROP :\ttx m.psa_ingress_output_metadata_egress_port'
-    )
-    spec = spec.replace(
-        'LABEL_DROP :    drop',
-        'LABEL_DROP :    tx m.psa_ingress_output_metadata_egress_port'
-    )
+    if not native_ternary:
+        # LABEL_DROP is now unreachable, but DPDK 20.11 still has to parse it
+        # and has no drop instruction.
+        spec = spec.replace(
+            'LABEL_DROP :\tdrop',
+            'LABEL_DROP :\ttx m.psa_ingress_output_metadata_egress_port'
+        )
+        spec = spec.replace(
+            'LABEL_DROP :    drop',
+            'LABEL_DROP :    tx m.psa_ingress_output_metadata_egress_port'
+        )
 
     # Fix 4: correct table sizes to match actual entry counts
     # (must satisfy n/4 = power of 2 for DPDK's hash bucket addressing)
@@ -113,7 +208,16 @@ def patch_spec_file(spec_path, entries_dir):
 
         # Keep one extra slot for default/action-state overhead to avoid commit failures
         # when table entry count equals nominal size.
-        correct_size = next_valid_size(n_entries + 1)
+        #
+        # The n/4 = power-of-2 rule comes from the exact-match (hash) backend's
+        # bucket addressing.  Wildcard tables are ACL-backed and only need the
+        # declared size to be large enough, so rounding up is harmless but the
+        # constraint does not apply to them.
+        is_wildcard = native_ternary and table_name.startswith('lookup_feature')
+        if is_wildcard:
+            correct_size = max(n_entries + 1, 8)
+        else:
+            correct_size = next_valid_size(n_entries + 1)
 
         in_target_table = False
         brace_depth = 0
@@ -218,8 +322,8 @@ def patch_spec_file(spec_path, entries_dir):
         f.write(spec)
     print(f"Patched spec written to {spec_path}")
 
-def generate_entry_files_rf(work_root, output_dir):
-    """Expand RF table JSON files into per-table entry files for dpdk-pipeline."""
+def generate_entry_files_rf(work_root, output_dir, native_ternary=False):
+    """Write RF table JSON files out as per-table entry files for dpdk-pipeline."""
     os.makedirs(output_dir, exist_ok=True)
 
     config_path = os.path.join(work_root, 'src', 'configs', 'Planter_config.json')
@@ -237,9 +341,14 @@ def generate_entry_files_rf(work_root, output_dir):
     with open(exact_json) as f:
         exact_table = json.load(f)
 
-    def covered_values(value, mask):
+    # Planter's Ternary_Table stores each entry as [mask, value, code] and the
+    # dict key is the priority (0 = highest, first match wins) — see
+    # src/functions/Range_to_TCAM_Top_Down.py, which tests a key with
+    # `key & mask == mask & value`.  covered_values() below therefore takes the
+    # mask first; the parameter names are inherited from the original code.
+    def covered_values(mask, value):
         target = value & mask
-        return [x for x in range(256) if (x & value) == target]
+        return [x for x in range(256) if (x & mask) == target]
 
     def pack_codes(codes_list, feature_n):
         """Pack per-tree codes into the single combined metadata value for feature_n.
@@ -258,14 +367,30 @@ def generate_entry_files_rf(work_root, output_dir):
     # Feature lookup tables (ternary) — write the packed combined code
     for n in range(4):
         lines = []
-        seen = {}
-        for entry in ternary_table[f'feature {n}'].values():
-            value, mask, code_list = entry[0], entry[1], entry[2]
-            code = pack_codes(code_list, n)
-            for x in covered_values(value, mask):
-                if x not in seen:
-                    seen[x] = code
-                    lines.append(f"match {x} action extract_feature{n} tree H({code})")
+        if native_ternary:
+            # One native wildcard entry per TCAM row.  The JSON key order is
+            # the priority order produced by Table_to_TCAM, and DPDK's wildcard
+            # backend treats a lower key_priority as higher precedence
+            # (rte_swx_table_wm.c: RTE_ACL_MAX_PRIORITY - key_priority), which
+            # matches Planter's first-match-wins convention directly.
+            for priority, entry in enumerate(ternary_table[f'feature {n}'].values()):
+                mask, value, code_list = entry[0], entry[1], entry[2]
+                code = pack_codes(code_list, n)
+                arg = fmt_action_arg(code, 'H', native_ternary)
+                lines.append(f"match {value}/{mask} priority {priority} "
+                             f"action extract_feature{n} tree {arg}")
+        else:
+            # DPDK 20.11 has no wildcard backend: expand each TCAM row into an
+            # exact entry per covered key value, keeping first-match-wins by
+            # never overwriting a value already claimed by a higher priority.
+            seen = {}
+            for entry in ternary_table[f'feature {n}'].values():
+                mask, value, code_list = entry[0], entry[1], entry[2]
+                code = pack_codes(code_list, n)
+                for x in covered_values(mask, value):
+                    if x not in seen:
+                        seen[x] = code
+                        lines.append(f"match {x} action extract_feature{n} tree H({code})")
         out_path = os.path.join(output_dir, f'lookup_feature{n}_entries.txt')
         with open(out_path, 'w') as f:
             f.write('\n'.join(lines) + '\n')
@@ -280,7 +405,10 @@ def generate_entry_files_rf(work_root, output_dir):
             f2   = entry['f2 code']
             f3   = entry['f3 code']
             leaf = entry['leaf']
-            lines.append(f"match {f0} {f1} {f2} {f3} action read_prob{n} prob H(0) vote H({int(leaf)})")
+            prob_arg = fmt_action_arg(0, 'H', native_ternary)
+            vote_arg = fmt_action_arg(leaf, 'H', native_ternary)
+            lines.append(f"match {f0} {f1} {f2} {f3} "
+                         f"action read_prob{n} prob {prob_arg} vote {vote_arg}")
         out_path = os.path.join(output_dir, f'lookup_leaf_id{n}_entries.txt')
         with open(out_path, 'w') as f:
             f.write('\n'.join(lines) + '\n')
@@ -291,22 +419,23 @@ def generate_entry_files_rf(work_root, output_dir):
     for entry in exact_table['decision'].values():
         votes = ' '.join(str(entry[f't{i} vote']) for i in range(n_trees))
         cls   = entry['class']
-        lines.append(f"match {votes} action read_lable label N({int(cls)})")
+        lines.append(f"match {votes} action read_lable "
+                     f"label {fmt_action_arg(cls, 'N', native_ternary)}")
     out_path = os.path.join(output_dir, 'decision_entries.txt')
     with open(out_path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
     print(f"  Wrote {len(lines)} entries -> {out_path}")
 
 
-def generate_entry_files(work_root, output_dir):
-    """Expand table JSON files into per-table entry files for dpdk-pipeline."""
+def generate_entry_files(work_root, output_dir, native_ternary=False):
+    """Write table JSON files out as per-table entry files for dpdk-pipeline."""
     config_path = os.path.join(work_root, 'src', 'configs', 'Planter_config.json')
     with open(config_path) as f:
         planter_config = json.load(f)
     model = planter_config.get('model config', {}).get('model', 'DT')
 
     if model in ('RF', 'XGB'):
-        generate_entry_files_rf(work_root, output_dir)
+        generate_entry_files_rf(work_root, output_dir, native_ternary=native_ternary)
         return
 
     # DT path
@@ -315,20 +444,29 @@ def generate_entry_files(work_root, output_dir):
     with open(ternary_json) as f:
         table = json.load(f)
 
-    def covered_values(value, mask):
+    # See generate_entry_files_rf(): entries are [mask, value, code], keyed by
+    # priority, matched as `key & mask == mask & value`.
+    def covered_values(mask, value):
         target = value & mask
-        return [x for x in range(256) if (x & value) == target]
+        return [x for x in range(256) if (x & mask) == target]
 
     # Feature lookup tables
     for n in range(4):
         lines = []
-        seen = {}
-        for entry in table[f'feature {n}'].values():
-            value, mask, code = entry[0], entry[1], entry[2]
-            for x in covered_values(value, mask):
-                if x not in seen:
-                    seen[x] = code
-                    lines.append(f"match {x} action extract_feature{n} tree H({int(code)})")
+        if native_ternary:
+            for priority, entry in enumerate(table[f'feature {n}'].values()):
+                mask, value, code = entry[0], entry[1], int(entry[2])
+                arg = fmt_action_arg(code, 'H', native_ternary)
+                lines.append(f"match {value}/{mask} priority {priority} "
+                             f"action extract_feature{n} tree {arg}")
+        else:
+            seen = {}
+            for entry in table[f'feature {n}'].values():
+                mask, value, code = entry[0], entry[1], int(entry[2])
+                for x in covered_values(mask, value):
+                    if x not in seen:
+                        seen[x] = code
+                        lines.append(f"match {x} action extract_feature{n} tree H({code})")
         out_path = os.path.join(output_dir, f'lookup_feature{n}_entries.txt')
         with open(out_path, 'w') as f:
             f.write('\n'.join(lines) + '\n')
@@ -339,52 +477,167 @@ def generate_entry_files(work_root, output_dir):
     for entry in table['code to vote'].values():
         f0, f1, f2, f3 = entry['f0 code'], entry['f1 code'], entry['f2 code'], entry['f3 code']
         leaf = entry['leaf']
-        lines.append(f"match {f0} {f1} {f2} {f3} action read_lable label N({int(leaf)})")
+        lines.append(f"match {f0} {f1} {f2} {f3} action read_lable "
+                     f"label {fmt_action_arg(leaf, 'N', native_ternary)}")
     out_path = os.path.join(output_dir, 'decision_entries.txt')
     with open(out_path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
     print(f"  Wrote {len(lines)} entries -> {out_path}")
 
 
-def generate_cli_script(cli_path, spec_path, entries_dir,
-                         input_pcap, output_pcap, model='DT', n_trees=5):
-    """Write the dpdk-pipeline CLI script."""
+def pipeline_table_names(model='DT', n_trees=5):
+    """Tables that receive entries, in the order they must be populated."""
     tables = [f'lookup_feature{n}' for n in range(4)]
     if model in ('RF', 'XGB'):
         tables += [f'lookup_leaf_id{i}' for i in range(n_trees)]
     tables.append('decision')
+    return tables
+
+
+def generate_io_file(io_path, input_pcap, output_pcap):
+    """Write the .io port-spec file used by DPDK 21.08+.
+
+    Every token in this file must be shorter than RTE_SWX_NAME_SIZE (64); the
+    parser rejects the whole file with "Token too big." otherwise.  This is why
+    the pcap files live in a short run directory rather than under the Planter
+    test_environment tree.
+    """
+    for path in (input_pcap, output_pcap):
+        if len(path) >= 64:
+            raise ValueError(
+                f"Path too long for the DPDK .io parser (limit 63 chars): {path}")
+    with open(io_path, 'w') as f:
+        f.write("mirroring slots 4 sessions 64\n")
+        f.write(f"port in 0 source mempool MEMPOOL0 file {input_pcap} loop 1 packets 0\n")
+        f.write(f"port out 0 sink file {output_pcap}\n")
+    print(f"IO spec written to {io_path}")
+
+
+def generate_cli_script(cli_path, spec_path, entries_dir,
+                        input_pcap, output_pcap, model='DT', n_trees=5,
+                        native_ternary=False, run_dir=None):
+    """Write the dpdk-pipeline CLI script for the target DPDK version."""
+    tables = pipeline_table_names(model, n_trees)
+
+    if not native_ternary:
+        # DPDK 20.11: the pipeline is built straight from the .spec and the
+        # ports are configured through the CLI.
+        with open(cli_path, 'w') as f:
+            f.write("mempool MEMPOOL0 buffer 2304 pool 32K cache 256 cpu 0\n")
+            f.write("pipeline PIPELINE0 create 0\n")
+            f.write(f"pipeline PIPELINE0 port in 0 source MEMPOOL0 {input_pcap}\n")
+            f.write(f"pipeline PIPELINE0 port out 0 sink {output_pcap}\n")
+            f.write(f"pipeline PIPELINE0 build {spec_path}\n")
+            for table in tables:
+                entry_file = os.path.join(entries_dir, f'{table}_entries.txt')
+                f.write(f"pipeline PIPELINE0 table {table} update "
+                        f"{entry_file} none none\n")
+            f.write("thread 1 pipeline PIPELINE0 enable\n")
+        print(f"CLI script written to {cli_path}")
+        return
+
+    # DPDK 21.08+: codegen -> libbuild -> build from the shared object, with
+    # the ports supplied by a separate .io spec.
+    run_dir = run_dir or os.path.dirname(cli_path)
+    os.makedirs(run_dir, exist_ok=True)
+    io_path  = os.path.join(run_dir, 'p.io')
+    code_c   = os.path.join(run_dir, 'p.c')
+    code_so  = os.path.join(run_dir, 'p.so')
+    generate_io_file(io_path, input_pcap, output_pcap)
+
     with open(cli_path, 'w') as f:
-        f.write("mempool MEMPOOL0 buffer 2304 pool 32K cache 256 cpu 0\n")
-        f.write("pipeline PIPELINE0 create 0\n")
-        f.write(f"pipeline PIPELINE0 port in 0 source MEMPOOL0 {input_pcap}\n")
-        f.write(f"pipeline PIPELINE0 port out 0 sink {output_pcap}\n")
-        f.write(f"pipeline PIPELINE0 build {spec_path}\n")
+        f.write("mempool MEMPOOL0 meta 0 pkt 2176 pool 32K cache 256 numa 0\n")
+        f.write(f"pipeline codegen {spec_path} {code_c}\n")
+        f.write(f"pipeline libbuild {code_c} {code_so}\n")
+        f.write(f"pipeline PIPELINE0 build lib {code_so} io {io_path} numa 0\n")
         for table in tables:
             entry_file = os.path.join(entries_dir, f'{table}_entries.txt')
-            f.write(f"pipeline PIPELINE0 table {table} update "
-                    f"{entry_file} none none\n")
-        f.write("thread 1 pipeline PIPELINE0 enable\n")
+            f.write(f"pipeline PIPELINE0 table {table} add {entry_file}\n")
+        f.write("pipeline PIPELINE0 commit\n")
+        f.write("pipeline PIPELINE0 enable thread 1\n")
     print(f"CLI script written to {cli_path}")
 
-def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, output_pcap=None, timeout=30):
+def find_rte_install_dir():
+    """Locate a DPDK source tree, needed by "pipeline libbuild".
+
+    The libbuild command shells out to gcc with -I paths under this directory
+    and needs the in-tree headers (notably rte_swx_pipeline_internal.h), which
+    are not part of the installed dev package.  When RTE_INSTALL_DIR is unset
+    the DPDK CLI falls back to its own cwd, which is almost never right.
+    """
+    env = os.environ.get('RTE_INSTALL_DIR')
+    if env and os.path.exists(os.path.join(env, 'lib', 'pipeline',
+                                           'rte_swx_pipeline_internal.h')):
+        return env
+    for base in (os.path.expanduser('~'), '/usr/src', '/opt'):
+        try:
+            names = sorted(os.listdir(base), reverse=True)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith('dpdk'):
+                continue
+            cand = os.path.join(base, name)
+            if os.path.exists(os.path.join(cand, 'lib', 'pipeline',
+                                           'rte_swx_pipeline_internal.h')):
+                return cand
+    return None
+
+
+def _output_pcap_from_cli(cli_path):
+    """Find the sink pcap for either CLI dialect (20.11 inline, 21.08+ .io)."""
+    try:
+        with open(cli_path) as cli_file:
+            cli_lines = cli_file.readlines()
+    except OSError:
+        return None
+
+    for line in cli_lines:
+        if line.startswith('pipeline PIPELINE0 port out 0 sink '):
+            return line.strip().split()[-1]
+
+    for line in cli_lines:
+        if ' io ' in line and ' build lib ' in line:
+            tokens = line.split()
+            io_path = tokens[tokens.index('io') + 1]
+            try:
+                with open(io_path) as io_file:
+                    for io_line in io_file:
+                        if io_line.startswith('port out 0 sink file '):
+                            return io_line.strip().split()[-1]
+            except (OSError, ValueError, IndexError):
+                return None
+    return None
+
+
+def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, output_pcap=None,
+                      timeout=30, file_prefix='planter'):
     """
     Launch dpdk-pipeline, wait for it to process packets, capture log.
     Returns (success, log_output)
     """
-    cmd = ['sudo', pipeline_binary, '--no-huge', '-m', '256', '-c', '0x3', '--', '-s', cli_path]
-    output_pcap = None
+    cmd = [pipeline_binary, '--no-huge', '-m', '256', '-l', '0-1',
+           '--file-prefix', file_prefix, '--', '-s', cli_path]
+
+    env = dict(os.environ)
+    install_dir = find_rte_install_dir()
+    if install_dir:
+        env['RTE_INSTALL_DIR'] = install_dir
 
     def has_cli_table_errors(log_text):
-        return ('Error in file "' in log_text) or ('Invalid entry in file' in log_text)
+        markers = (
+            'Error in file "',            # 20.11 entry file error
+            'Invalid entry in file',      # 21.08+ entry file error
+            'Pipeline build failed',
+            'Library build failed',
+            'Token too big',
+            'Invalid value for argument',
+            'Cannot open file',
+            'Command "pipeline" failed',
+        )
+        return any(m in log_text for m in markers)
 
-    try:
-        with open(cli_path, 'r') as cli_file:
-            for line in cli_file:
-                if line.startswith('pipeline PIPELINE0 port out 0 sink '):
-                    output_pcap = line.strip().split()[-1]
-                    break
-    except OSError:
-        pass
+    output_pcap = _output_pcap_from_cli(cli_path) or output_pcap
 
     if output_pcap and os.path.exists(output_pcap):
         try:
@@ -392,12 +645,19 @@ def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, output_pcap=None, tim
         except OSError:
             pass
 
+    # A leftover runtime directory from a killed run makes EAL refuse to start.
+    for rt_base in (f'/run/user/{os.getuid()}/dpdk', '/var/run/dpdk'):
+        stale = os.path.join(rt_base, file_prefix)
+        if os.path.isdir(stale):
+            shutil.rmtree(stale, ignore_errors=True)
+
     try:
         result = sub.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=timeout
+            timeout=timeout,
+            env=env,
         )
         log_output = result.stdout + result.stderr
         with open(log_path, 'w') as f:
@@ -422,14 +682,39 @@ def run_dpdk_pipeline(cli_path, pipeline_binary, log_path, output_pcap=None, tim
 def add_make_run_model(fname, config):
     work_root, model_test_root, file_name, test_file_name = file_names(config)
     
+    dpdk_version = detect_dpdk_version(config)
+    native_ternary = uses_native_ternary(dpdk_version)
+    print(f"Target DPDK {dpdk_version[0]}.{dpdk_version[1]:02d} — "
+          f"{'native ternary tables' if native_ternary else 'ternary expanded to exact match'}")
+
     spec_dir    = os.path.join(model_test_root, 'spec')
     entries_dir = os.path.join(model_test_root, 'entries')
     manual_entries_dir = os.path.join(work_root, 'scripts', 'dpdk_entries')
-    input_pcap  = os.path.join(model_test_root, 'test_input.pcap')
-    output_pcap = os.path.join(model_test_root, 'test_output.pcap')
     cli_path    = os.path.join(model_test_root, 'run.cli')
     log_path    = os.path.join(model_test_root, 'run.log')
-    pipeline_bin = os.path.expanduser('~/dpdk_pipeline_build/build/pipeline')
+
+    # DPDK 21.08+ parses the pcap paths out of the .io file, where every token
+    # must be under RTE_SWX_NAME_SIZE (64) chars.  The Planter test_environment
+    # path alone is ~89 chars, so the pcaps go in a short run directory.
+    run_dir = config.get('dpdk config', {}).get('run dir') or \
+        os.path.expanduser('~/.planter_dpdk')
+    if native_ternary:
+        os.makedirs(run_dir, exist_ok=True)
+        input_pcap  = os.path.join(run_dir, 'in.pcap')
+        output_pcap = os.path.join(run_dir, 'out.pcap')
+    else:
+        input_pcap  = os.path.join(model_test_root, 'test_input.pcap')
+        output_pcap = os.path.join(model_test_root, 'test_output.pcap')
+
+    pipeline_bin = config.get('dpdk config', {}).get('pipeline_bin') or ''
+    if not os.path.exists(pipeline_bin):
+        candidates = [os.path.expanduser('~/dpdk_pipeline_build/build/pipeline')]
+        install_dir = find_rte_install_dir()
+        if install_dir:
+            candidates.insert(0, os.path.join(install_dir, 'examples', 'pipeline',
+                                              'build', 'pipeline'))
+        pipeline_bin = next((c for c in candidates if os.path.exists(c)),
+                            candidates[-1])
 
     p4_file = os.path.join(work_root, 'P4', file_name + '.p4')
 
@@ -462,26 +747,32 @@ def add_make_run_model(fname, config):
             print("Force-generating table entry files (PLANTER_FORCE_GENERATE_ENTRIES=1)...")
         else:
             print("Generating table entry files...")
-        generate_entry_files(work_root, entries_source_dir)
+        generate_entry_files(work_root, entries_source_dir,
+                             native_ternary=native_ternary)
 
     # Step 3 — patch spec (now entry files exist for size counting)
     print("Patching spec file...")
-    patch_spec_file(spec_path, entries_source_dir)
+    patch_spec_file(spec_path, entries_source_dir, native_ternary=native_ternary)
 
     # Step 4 — generate CLI script
     print("Generating CLI script...")
     model = config['model config']['model']
     n_trees = config['model config'].get('number of trees', 5)
     generate_cli_script(cli_path, spec_path, entries_source_dir, input_pcap, output_pcap,
-                        model=model, n_trees=n_trees)
+                        model=model, n_trees=n_trees,
+                        native_ternary=native_ternary, run_dir=run_dir)
 
     # Store paths in config for test_model.py to use
     config['dpdk config'] = {
         'cli_path':     cli_path,
+        'input_pcap':   input_pcap,
         'output_pcap':  output_pcap,
         'log_path':     log_path,
         'pipeline_bin': pipeline_bin,
         'entries_dir':  entries_source_dir,
+        'run dir':      run_dir,
+        'version':      f'{dpdk_version[0]}.{dpdk_version[1]:02d}',
+        'native ternary': native_ternary,
     }
     json.dump(config, open('src/configs/Planter_config.json', 'w'), indent=4)
     print("run_model setup complete — ready to run pipeline")
@@ -499,8 +790,17 @@ def main(if_using_subprocess):
 
     config_file = 'src/configs/Planter_config.json'
     Planter_config = json.load(open(config_file, 'r'))
-    Planter_config['test config']['sudo password'] = getpass.getpass(
-        "- Please input your password for 'sudo' command: ") or 'raspberry'
+    # The pipeline app runs unprivileged (--no-huge), so the password is only
+    # kept for compatibility with other targets and must not block a
+    # non-interactive run.
+    try:
+        Planter_config['test config']['sudo password'] = getpass.getpass(
+            "- Please input your password for 'sudo' command: ") or 'raspberry'
+    except (EOFError, OSError):
+        print("- No TTY available; skipping sudo password prompt "
+              "(not needed for the unprivileged DPDK pipeline).")
+        Planter_config.setdefault('test config', {}).setdefault(
+            'sudo password', 'raspberry')
     json.dump(Planter_config, open(config_file, 'w'), indent=4, cls=NpEncoder)
 
     add_make_run_model(config_file, Planter_config)
