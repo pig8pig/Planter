@@ -747,7 +747,8 @@ def add_make_run_model(fname, config):
         return
 
     # Step 2 — choose entry source FIRST (patch_spec_file needs them for size calculation)
-    if manual_entries_available and not force_generate_entries:
+    use_manual_entries = os.environ.get('PLANTER_USE_MANUAL_ENTRIES', '0') == '1'
+    if manual_entries_available and use_manual_entries and not force_generate_entries:
         entries_source_dir = manual_entries_dir
         print(f"Using pre-validated entry files from {entries_source_dir}")
     else:
