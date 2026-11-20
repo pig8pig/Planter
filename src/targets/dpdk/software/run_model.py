@@ -32,6 +32,15 @@ from src.functions.add_license import *
 from src.functions.extract_log_file_info import *
 
 
+def actual_n_trees(config, default=5):
+    """Number of trees actually trained.  XGB rounds the requested count down
+    to a multiple of the class count (one tree per class per boosting round)
+    and records the real value under 'p4 config'; RF stores the same value in
+    both places."""
+    return config.get('p4 config', {}).get('number of trees') or \
+        config.get('model config', {}).get('number of trees', default)
+
+
 def file_names(Planter_config):
     work_root = Planter_config['directory config']['work']
     model_test_root = Planter_config['directory config']['work'] + '/src/targets/dpdk/software/model_test/test_environment'
@@ -193,7 +202,7 @@ def patch_spec_file(spec_path, entries_dir, native_ternary=False):
     _model = _cfg.get('model config', {}).get('model', 'DT')
     table_entry_files = {f'lookup_feature{n}': f'lookup_feature{n}_entries.txt' for n in range(4)}
     if _model in ('RF', 'XGB'):
-        _n_trees = _cfg.get('model config', {}).get('number of trees', 5)
+        _n_trees = actual_n_trees(_cfg)
         for i in range(_n_trees):
             table_entry_files[f'lookup_leaf_id{i}'] = f'lookup_leaf_id{i}_entries.txt'
     table_entry_files['decision'] = 'decision_entries.txt'
@@ -719,7 +728,7 @@ def add_make_run_model(fname, config):
     p4_file = os.path.join(work_root, 'P4', file_name + '.p4')
 
     _model_name  = config['model config']['model']
-    _n_trees_req = config['model config'].get('number of trees', 5)
+    _n_trees_req = actual_n_trees(config)
     required_entry_files = [f'lookup_feature{n}_entries.txt' for n in range(4)]
     if _model_name in ('RF', 'XGB'):
         required_entry_files += [f'lookup_leaf_id{i}_entries.txt' for i in range(_n_trees_req)]
@@ -757,7 +766,7 @@ def add_make_run_model(fname, config):
     # Step 4 — generate CLI script
     print("Generating CLI script...")
     model = config['model config']['model']
-    n_trees = config['model config'].get('number of trees', 5)
+    n_trees = actual_n_trees(config)
     generate_cli_script(cli_path, spec_path, entries_source_dir, input_pcap, output_pcap,
                         model=model, n_trees=n_trees,
                         native_ternary=native_ternary, run_dir=run_dir)

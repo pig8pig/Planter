@@ -182,7 +182,9 @@ def ten_to_bin(num,count):
 def create_tables_Commend(fname, config):
     num_features = config['data config']['number of features']
     num_classes = config['model config']['number of classes']
-    num_trees = config['model config']['number of trees']
+    # XGB trains (classes * rounds) trees, which can be fewer than requested;
+    # use the actual count recorded by table_generator.
+    num_trees = config['p4 config']['number of trees']
     Ternary_Table = json.load(open('Tables/Ternary_Table.json', 'r'))
     with open(fname, 'w') as file:
 
