@@ -30,7 +30,10 @@ from mininet.link import TCLink
 from mininet.cli import CLI
 
 from p4runtime_switch import P4RuntimeSwitch
-import p4runtime_lib.simple_controller
+try:
+    import p4runtime_lib.simple_controller
+except ImportError:
+    p4runtime_lib = None  # gRPC not installed; the cli_input path still works
 
 def configureP4Switch(**switch_args):
     """ Helper class that is called by mininet to initialize
